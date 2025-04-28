@@ -525,6 +525,7 @@ class QR_code:
         # Convert the 15-bit final codeword to a 1D numpy array of bits (MSB first).
         bits = [(final_codeword >> i) & 1 for i in range(14, -1, -1)]
         format_array = np.array(bits)
+        format = format_array
         ################################################################################################################
 
         assert len(np.shape(format))==1 and type(format) is np.ndarray and format.size==15, 'format must be a 1D numpy array of length 15'
@@ -544,7 +545,180 @@ class QR_code:
         ################################################################################################################
         #insert your code here
 
+        format_mask = 0b101010000010010
+        binary_str = ''.join(Format.astype(str))
+        integer_value_codeword = int(binary_str, 2)
+        integer_codeword = integer_value_codeword ^format_mask
+        codeword = np.array([0]*(15-len(list(np.binary_repr(integer_codeword))))+list(np.binary_repr(integer_codeword)), dtype = int)
+        # Apply the mask
 
+        def gf16_mult(a, b, prim_poly=0b10011):
+            """Multiply two GF(16) elements modulo x^4 + x + 1."""
+            product = 0
+            if a != 0 and b !=0:
+                for _ in range(int(np.floor(max(np.log2(a), np.log2(b))))+1):
+                    if b & 1:
+                        product ^= a
+                    a <<= 1
+                    if a & 0b10000:
+                        a ^= prim_poly
+                    b >>= 1
+            return product
+
+        def gf16_add(a, b):
+            return a^b
+
+        def gf16_divide(a, b, prim_poly = 0b10011):
+            """Divide two GF(16) elements modulo x^4 + x + 1. 
+            a divided by b
+            """
+            inv_table = [0, 1, 9, 14, 13, 11, 7, 6, 15, 2, 12, 5, 10, 4, 3, 8]
+            return gf16_mult(a, inv_table[b], prim_poly= prim_poly)
+
+        def gf16_power(a, power, prim_poly = 0b10011):
+            """Raise a to power in GF(16) elements modulo x^4 + x + 1.
+            a^power
+            """
+            result = 1
+            for i in range(power):
+                result = gf16_mult(result, a, prim_poly = prim_poly)
+            return result
+
+        def compute_Ej(r, alpha):
+            '''
+            Args:
+                r (list of bits): received codeword
+                alpha (int): primitive element (2)
+            Returns:
+                Syndromes 0 to 5
+            '''
+            S0 = 0
+            S1 = 0
+            S2 = 0
+            S3 = 0
+            S4 = 0
+            S5 = 0
+            for i, e in enumerate(r):
+                S0 = gf16_add(gf16_mult(gf16_power(alpha, i), e), S0)
+                S1 = gf16_add(gf16_mult(gf16_power(alpha, 2*i), e), S1)
+                S2 = gf16_add(gf16_mult(gf16_power(alpha, 3*i), e), S2)
+                S3 = gf16_add(gf16_mult(gf16_power(alpha, 4*i), e), S3)
+                S4 = gf16_add(gf16_mult(gf16_power(alpha, 5*i), e), S4)
+                S5 = gf16_add(gf16_mult(gf16_power(alpha, 6*i), e), S5)
+            return S0, S1, S2, S3, S4, S5
+
+        def berlekamp_massey2(S, t):
+            """
+            Iterative Berlekamp-Massey Algorithm to compute the error locator polynomial.
+            
+            Args:
+                S (list): Syndrome sequence.
+                t (int): Maximum number of correctable errors.
+
+            Returns:
+                Lambda: Coefficients of the error locator polynomial Λ(z), from lowest to highest degree.
+                error: Returns 1 if there is an error
+            """
+            error = 0
+            # Step 1: Initialization
+            i = 1
+            L = 0
+            Lambda = [1]  # Λ(z) = 1
+            B = [0, 1]    # B(z) = z
+
+            while i < 2*t+1:
+                delta = S[i-1]
+                for j in range(1, L+1):
+                    if j < len(Lambda):
+                        delta = gf16_add(delta, gf16_mult(Lambda[j], S[i-1-j]))
+                if delta != 0:
+                    delta_B = [gf16_mult(b, delta) for b in B]
+                    Lambda_new = Lambda + [0]*(len(delta_B) - len(Lambda))
+                    for j in range(len(delta_B)):
+                        Lambda_new[j] = gf16_add(Lambda_new[j], delta_B[j])
+                    if 2*L < i:
+                        L = i - L
+                        B = Lambda
+                        for j, e in enumerate(Lambda):
+                            B[j] = gf16_divide(e, delta)
+                    Lambda = Lambda_new
+                B = [0] + B
+                i+=1
+                if len(Lambda) > t+1:
+                    error = 1
+                    #decoder can not decode error
+            return Lambda, error
+
+        def compute_Ej_recursive(Lambda, known_Ej, n , nu):
+            """
+            Compute E_j recursively for j = nu+1 to n-1 using:
+            E_j = -sum_{k=1}^{nu} Lambda_k * E_{j-k}
+
+            Args:
+                Lambda: List of coefficients [Lambda_1, Lambda_2, ..., Lambda_nu].
+                known_Ej: List of known E_j (syndromes) for j = 1 to 2t.
+                n: Codeword length (15)
+                nu: len(Lambda).
+
+            Returns:
+                List of all E_j for j = 1 to n-1.
+            """
+            nu = len(Lambda)
+            Ej = known_Ej.copy()
+
+            for j in range(6 + 1, n):  # j = nu+1 to n-1
+                # Compute E_j = -sum_{k=1}^{nu} Lambda_k * E_{j-k}
+                Ej_j = 0
+                for k in range(1, nu):
+                    Ej_j ^= gf16_mult(Lambda[k], Ej[j - k])
+                Ej.append(Ej_j)
+
+            return Ej
+
+        def inverse_fourier_transform(Ej, n=15):
+            """
+            Convert E_j to e_i using inverse Fourier transform.
+            Args:
+                Ej: List of E_j (length n).
+                n: Codeword length.
+            Returns:
+                List of e_i where 1 indicates an error at position i.
+            """
+            alpha = 2
+            e_i = [0]*n
+            for i, e in enumerate(e_i):
+                for j in range(15):
+                    "ei = Sum_{j = 0}^{14} Ej * alpha^{-i * j}"
+                    e_i[i] = gf16_add(e_i[i], gf16_divide(Ej[j], gf16_power(alpha, i*j)))
+                if e_i[i] != 0 and e_i[i] != 1:
+                    return [], 1
+            if sum(e_i)>7:
+                for i in range(len(e_i)):
+                    e_i[i] = 1-e_i[i]
+            return e_i, 0
+
+        t = 3
+        alpha = 2
+
+        S0, S1, S2, S3, S4, S5 = compute_Ej(codeword[::-1], alpha)
+        syndromes = [S0, S1, S2, S3, S4, S5]
+        Lambdas, error = berlekamp_massey2(syndromes, t)
+        Total_Ej = compute_Ej_recursive(Lambdas, [sum(codeword)%2]+syndromes, 15, 6)
+        fouten, error = inverse_fourier_transform(Total_Ej, 15)
+        if error == 1:
+            success = 0
+            level = 'L'
+            mask = [0, 0, 0]
+            return success, level, mask
+        corrected_codeword = codeword^fouten[::-1]
+        # print(codeword)
+        # print(fouten)
+        success = 1
+        levels = ['M', 'L', 'H', 'Q']
+        # print(2*corrected_codeword[0]+corrected_codeword[1])
+        # print(corrected_codeword[0], corrected_codeword[1])
+        level = levels[2*corrected_codeword[0]+corrected_codeword[1]]
+        mask = list(corrected_codeword[2:5])
 
         ################################################################################################################
 
